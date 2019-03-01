@@ -27,5 +27,8 @@ install:modules insmod mknod
 clean distclean:
 	rm -f *.o *.mod.c .*.*.cmd *.ko
 	rm -rf .tmp_versions
+	rm -rf Module.symvers
+	rm -rf modules.order
+	rm -rf test
 endif
 

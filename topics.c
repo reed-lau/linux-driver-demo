@@ -1,3 +1,4 @@
+#include <linux/shmem_fs.h>
 #include <linux/anon_inodes.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -6,23 +7,36 @@
 #include <linux/file.h>
 #include <linux/mm.h>
 #include <linux/mman.h>
-#include <linux/shmem_fs.h>
 #include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/delay.h>
 #include <linux/uaccess.h>
+#include <linux/kallsyms.h>
 #include "topics.h"
+
+static int (*shmem_zero_setup_ptr)(struct vm_area_struct *) = NULL;
+
+int shmem_zero_setup(struct vm_area_struct *vma)
+{
+        if (!shmem_zero_setup_ptr)
+                    shmem_zero_setup_ptr = kallsyms_lookup_name("shmem_zero_setup");
+            return shmem_zero_setup_ptr(vma);
+}
 
 #define TOPICS_MAJOR 231
 #define DEVICE_NAME "topics"
 
 static int i = 0;
-struct file *anon_file = NULL;
-struct file *filp = NULL;
+
+/**
+ * struct topics - The topics related shared memory 
+ * @name:    The topic of the shared memory
+ * @file     The backing file
+ * @size     The size of one topic of the shared memory
+ */
 
 struct topics {
     char name[1024];
-    struct list_head topics_list;
     struct file *file;
     size_t size;
 };
@@ -31,7 +45,13 @@ static DEFINE_MUTEX(topics_mutex);
 
 static struct kmem_cache *topics_cache __read_mostly;
 
-
+/**
+ * topics_open() - Open Shared memory of one topic name 
+ * @inode:   The backing file's inode
+ * @file:    The backing file
+ *
+ * Return: 0 if successful, or another code if unsuccessful.
+ */
 static int topics_open(struct inode *inode, struct file *file){
     struct topics *topic;
     int ret;
@@ -44,7 +64,6 @@ static int topics_open(struct inode *inode, struct file *file){
     if ( !topic )
         return -ENOMEM;
 
-    INIT_LIST_HEAD(&topic->topics_list);
     memcpy(topic->name, "topic", 5);
     file->private_data = topic;
 
@@ -52,10 +71,18 @@ static int topics_open(struct inode *inode, struct file *file){
     return 0;
 }
 
+/**
+ * topics_release() - Release the shared memory of one topic name
+ * @inode:   The backing file's inode
+ * @file:    The backing file
+ *
+ * Return: 0 if successful. If it is anything else, go have a coffee
+ * and try again
+ */
 static int topics_release(struct inode *inode, struct file *file) {
     struct topics *topic = file->private_data;
 
-    printk(KERN_EMERG "topics: close total\n");
+    printk(KERN_EMERG "topics: release\n");
     if ( topic->file )
         fput(topic->file);
 
@@ -64,134 +91,78 @@ static int topics_release(struct inode *inode, struct file *file) {
     return 0;
 }
 
-static int set_name(struct topics *topic, void __user *name) {
-    printk(KERN_EMERG "topics: set_name enter topic=%p name=%p\n", topic, name);
-    int ret = 0;
-    char local_name[1024];
 
-    strncpy_from_user(local_name, name, 1024);
+static int topics_mmap(struct file *file, struct vm_area_struct *vma) {
+    struct topics *topic = file->private_data; 
+    // mutex_lock(&topics_mutex);
+    // mutex_unlock(&topics_mutex);
 
-    mutex_lock(&topics_mutex);
-    if ( topic->file )
+    int ret;
+
+    /*
+    if (!topic->size) {
         ret = -EINVAL;
-    else
-        strcpy(topic->name, local_name);
-    mutex_unlock(&topics_mutex);
+        goto out;
+    }
+    */
 
-    return ret;
-}
-
-static int get_fd(struct topics *topic) {
-    int ret = 0;
-    printk(KERN_EMERG "topics: get_fd topic=%p\n", topic);
-
-    if ( IS_ERR(filp) ) {
-    // if ( !topic->file ) {
-        filp = filp_open("liuwei", O_CREAT | O_RDWR | O_CLOEXEC, 0666);
-        if ( IS_ERR(filp) )
-            ret = -EINVAL;
-
-        topic->file = filp; 
-    } else {
-        topic->file = filp;
-        get_file(filp);
+    // must set shared among process
+    if (!(vma->vm_flags & VM_SHARED)) {
+        ret = -EINVAL;
+        goto out;
     }
 
-    int fd = get_unused_fd_flags(0);
+    printk(KERN_EMERG "topics: mmap %d\n", vma->vm_flags);
 
-    fd_install(fd, topic->file);
-    ret = fd;
+    // name and size has not been set by ioctl()
+    // init it here
+    if (!topic->file) {
+        struct file *vmfile;
 
+        printk(KERN_EMERG "topics: 1 -----\n");
+
+        vmfile = shmem_file_setup("xyzw", 1024, vma->vm_flags);
+        if (IS_ERR(vmfile)) {
+            ret = PTR_ERR(vmfile);
+            goto out;
+        }
+
+        topic->file = vmfile;
+        vmfile->f_mode |= FMODE_LSEEK;
+        printk(KERN_EMERG "topics: 2 -------\n");
+    }
+
+    // increase refcnt
     get_file(topic->file);
 
+    ret = shmem_zero_setup(vma);
+    if (ret) {
+        fput(topic->file);
+        goto out;
+    }
+
+    if (vma->vm_file)
+        fput(vma->vm_file);
+
+    vma->vm_file = topic->file;
+    printk(KERN_EMERG "topics: mmap ok mmap called [%d] times\n", i++);
+
+out:
     return ret;
 }
-
-static int xx_release(struct inode *inode, struct file *file) {
-    printk(KERN_EMERG "topics: ------------------------------------------ release\n");
-    fput(anon_file);
-    anon_file = NULL;
-    return 0;
-}
-
-static int xx_mmap(struct file *file, struct vmarea_struct *vma) {
-    printk(KERN_EMERG "topics: mmap\n");
-    return 0;
-}
-
-struct file_operations xx_fops ={
-    .release = xx_release,
-};
 
 static long topics_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     struct topics *topic = file->private_data;
     int ret = -ENOTTY;
-
-    switch (cmd) {
-        case TOPICS_SET_NAME:
-            ret = set_name(topic, (void __user*)arg);
-            break;
-        case TOPICS_GET_NAME:
-            break;
-        case TOPICS_SET_SIZE:
-            break;
-        case TOPICS_GET_SIZE:
-            break;
-        case TOPICS_GET_FD:
-
-            if ( !anon_file ) {
-                anon_file = shmem_file_setup("[liuwei]", 1000, 0);
-                // anon_file = anon_inode_getfile("[liuwei]", &xx_fops, NULL, O_CREAT | O_RDWR | O_CLOEXEC);
-            } else {
-                get_file(anon_file);
-            }
-
-            int fd = get_unused_fd_flags(O_CLOEXEC);
-            fd_install(fd, anon_file);
-            ret = fd;
-
-            printk(KERN_EMERG "topics: process:%lu\n", anon_file->f_count);
-            break;
-    }
-
     printk(KERN_EMERG "topics: ioctl\n");
     return ret;
-}
-
-static ssize_t topics_write(struct file *file, const char __user * buf, size_t count, loff_t *ppos){
-    int fd;
-    int err = 0;
-    struct file *filp;
-    printk(KERN_EMERG "topics: write. i = %d\n", ++i);
-
-    // fd = anon_inode_getfd("liuwei", &internal_fops, NULL,O_CREAT | O_RDWR | O_CLOEXEC);
-
-    fd = get_unused_fd_flags(0);
-    // fd = anon_inode_getfd("liuwei", &internal_fops, NULL,O_CREAT | O_RDWR | O_CLOEXEC);
-
-    if ( !filp ) {
-        filp = filp_open("liuwei", O_CREAT | O_RDWR | O_CLOEXEC, 0666);
-        printk(KERN_EMERG "topics write: filp not exists, create one:%p\n", filp);
-    } else {
-        printk(KERN_EMERG "topics write: filp has exists, attach one:%p\n", filp);
-    }
-
-    if ( IS_ERR(filp) ) {
-        err = PTR_ERR(filp);
-        printk(KERN_EMERG "topics write: filp fail\n");
-        return -1;
-    }
-
-    fd_install(fd, filp);
-
-    printk(KERN_EMERG "topics write: filp: fd = %d\n", fd);
-    return fd;
 }
 
 static struct file_operations topics_flops = {
     .owner          = THIS_MODULE,
     .open           = topics_open,
     .release        = topics_release,
+    .mmap           = topics_mmap,
     .unlocked_ioctl = topics_ioctl
 };
 
@@ -219,7 +190,6 @@ static void __exit topics_exit(void){
     unregister_chrdev(TOPICS_MAJOR, DEVICE_NAME);
     printk(KERN_EMERG"topics: --- exit ---\n");
 }
-
 
 module_init(topics_init);
 module_exit(topics_exit);
